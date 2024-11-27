@@ -17,7 +17,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use snap::raw::{Decoder, Encoder};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 mod crypt_file_header;
 use crypt_file_header::{Mode, NCryptFileHeader};
@@ -43,30 +43,30 @@ pub fn encrypt(
     inputfile: PathBuf,
     outputfile: PathBuf,
 ) -> Result<()> {
-    let mut key: [u8; XCHACHA20_KEY_LEN] = [0; XCHACHA20_KEY_LEN];
+    let mut key: Zeroizing<[u8; XCHACHA20_KEY_LEN]> = Zeroizing::new([0; XCHACHA20_KEY_LEN]);
     let password_salt: Option<[u8; ARGON2_SALT_LEN]>;
     let mode: Mode;
 
     if let Some(keyfile) = keyfile {
         // User wants to encrypt file with a keyfile
-
         print_log(verbose, format!["Reading keyfile"]);
 
-        key = pem_to_keyfile(&fs::read_to_string(&keyfile)?)?;
+        let keyfile_content: Zeroizing<String> = Zeroizing::new(fs::read_to_string(&keyfile)?);
+        key = Zeroizing::new(pem_to_keyfile(&keyfile_content)?);
 
         password_salt = None;
         mode = Mode::Keyfile;
     } else {
         // User wants to encrypt file with a password
-
-        let mut password: String = rpassword::prompt_password("Password: ")?;
+        let password: Zeroizing<String> = Zeroizing::new(rpassword::prompt_password("Password: ")?);
 
         print_log(verbose, format!["Deriving key from password"]);
 
         let mut salt: [u8; ARGON2_SALT_LEN] = [0; ARGON2_SALT_LEN];
         OsRng.fill_bytes(&mut salt);
 
-        if let Err(err) = Argon2::default().hash_password_into(password.as_bytes(), &salt, &mut key)
+        if let Err(err) =
+            Argon2::default().hash_password_into(password.as_bytes(), &salt, key.as_mut_slice())
         {
             return Err(anyhow::Error::msg(format![
                 "Failed to derive key from password ({})",
@@ -74,14 +74,11 @@ pub fn encrypt(
             ]));
         }
 
-        password.zeroize();
-
         password_salt = Some(salt);
         mode = Mode::Password;
     }
 
-    let cipher: XChaCha20Poly1305 = XChaCha20Poly1305::new(&key.into());
-    key.zeroize();
+    let cipher: XChaCha20Poly1305 = XChaCha20Poly1305::new(key.as_ref().into());
 
     let unencrypted_file_metadata: Metadata = fs::metadata(&inputfile)?;
     let mut unencrypted_file: File = File::open(&inputfile)?;
@@ -103,7 +100,9 @@ pub fn encrypt(
     );
 
     print_log(verbose, format!["Encrypting..."]);
-    let mut buffer: Vec<u8> = vec![0; BUFFER_LEN];
+    let mut buffer: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0; BUFFER_LEN]);
+    let mut data_to_write: Zeroizing<Vec<u8>>;
+    let mut data_length_to_write: Zeroizing<u32>;
     let mut encoder: Encoder = Encoder::new();
     loop {
         let read_bytes: usize = unencrypted_file.read(&mut buffer)?;
@@ -112,15 +111,15 @@ pub fn encrypt(
             break;
         }
 
-        let data_to_write: &[u8] = {
+        data_to_write = {
             if compression {
-                &encoder.compress_vec(&buffer[..read_bytes])?
+                Zeroizing::new(encoder.compress_vec(&buffer[..read_bytes])?)
             } else {
-                &buffer[..read_bytes]
+                Zeroizing::new(buffer[..read_bytes].as_ref().to_vec())
             }
         };
 
-        let data_length_to_write: u32 = (data_to_write.len() + XCHACHA20_TAG_LEN) as u32;
+        data_length_to_write = Zeroizing::new((data_to_write.len() + XCHACHA20_TAG_LEN) as u32);
 
         match cipher.encrypt(
             nonce.as_ref().into(),
@@ -139,7 +138,7 @@ pub fn encrypt(
             }
         }
 
-        match cipher.encrypt(nonce.as_ref().into(), data_to_write) {
+        match cipher.encrypt(nonce.as_ref().into(), data_to_write.as_ref()) {
             Ok(ciphertext) => {
                 encrypted_file.write_all(&ciphertext)?;
 
@@ -174,42 +173,43 @@ pub fn decrypt(
     let crypt_header: NCryptFileHeader = NCryptFileHeader::read_from_file(&mut encrypted_file)?;
     let mut nonce: [u8; XCHACHA20_NONCE_LEN] = crypt_header.nonce;
 
-    let mut key: [u8; XCHACHA20_KEY_LEN] = [0; XCHACHA20_KEY_LEN];
+    let mut key: Zeroizing<[u8; XCHACHA20_KEY_LEN]> = Zeroizing::new([0; XCHACHA20_KEY_LEN]);
 
     if keyfile.is_some() && crypt_header.mode == Mode::Keyfile {
         print_log(verbose, format!["Reading keyfile"]);
-        key = pem_to_keyfile(&fs::read_to_string(&keyfile.unwrap())?)?; // Unwrap is safe
+
+        let keyfile_content: Zeroizing<String> =
+            Zeroizing::new(fs::read_to_string(&keyfile.unwrap())?); // Unwrap is safe
+
+        key = Zeroizing::new(pem_to_keyfile(&keyfile_content)?);
     } else if keyfile.is_none() && crypt_header.mode == Mode::Keyfile {
         return Err(anyhow::Error::msg(format![
             "File was encrypted with a keyfile -> provide a keyfile"
         ]));
     } else if keyfile.is_none() && crypt_header.mode == Mode::Password {
-        let mut password: String = rpassword::prompt_password("Password: ")?;
+        let password: Zeroizing<String> = Zeroizing::new(rpassword::prompt_password("Password: ")?);
 
         print_log(verbose, format!["Deriving key from password"]);
 
-        // Unwrap is safe
         if let Err(err) = Argon2::default().hash_password_into(
             password.as_bytes(),
-            crypt_header.password_salt.as_ref().unwrap(),
-            &mut key,
+            crypt_header.password_salt.as_ref().unwrap(), // Unwrap is safe
+            key.as_mut_slice(),
         ) {
             return Err(anyhow::Error::msg(format![
                 "Failed to derive key from password ({})",
                 err
             ]));
         }
-
-        password.zeroize();
     } else if keyfile.is_some() && crypt_header.mode == Mode::Password {
         return Err(anyhow::Error::msg(format![
             "File was encrypted with a password -> provide a password (remove keyfile)"
         ]));
     }
 
+    let cipher: XChaCha20Poly1305 = XChaCha20Poly1305::new(key.as_ref().into());
+
     let mut unencrypted_file: File = File::create(&outputfile)?;
-    let cipher: XChaCha20Poly1305 = XChaCha20Poly1305::new(&key.into());
-    key.zeroize();
 
     let progress_bar: ProgressBar = ProgressBar::new(encrypted_file_metadata.len());
     progress_bar.set_style(
@@ -219,10 +219,14 @@ pub fn decrypt(
     );
 
     print_log(verbose, format!["Decrypting..."]);
-    let mut length_buffer: [u8; 4 + XCHACHA20_TAG_LEN] = [0; 4 + XCHACHA20_TAG_LEN];
+    let mut length_buffer: Zeroizing<[u8; 4 + XCHACHA20_TAG_LEN]> =
+        Zeroizing::new([0; 4 + XCHACHA20_TAG_LEN]);
+    let mut decrypted_data: Zeroizing<Vec<u8>>;
     let mut decoder: Decoder = Decoder::new();
     loop {
-        if let Err(_) = encrypted_file.read_exact(&mut length_buffer) {
+        let read_bytes: usize = encrypted_file.read(length_buffer.as_mut_slice())?;
+
+        if read_bytes == 0 {
             break;
         }
 
@@ -246,12 +250,12 @@ pub fn decrypt(
         let mut encrypted_data: Vec<u8> = vec![0; data_length as usize];
         encrypted_file.read_exact(&mut encrypted_data)?;
 
-        let decrypted_data: Vec<u8> =
+        decrypted_data =
             match cipher.decrypt(&nonce.into(), encrypted_data.as_ref()) {
                 Ok(decrypted_data) => {
                     increment_nonce(&mut nonce);
 
-                    decrypted_data
+                    Zeroizing::new(decrypted_data)
                 }
                 Err(_) => return Err(anyhow::Error::msg(
                     "Failed to decrypt data (invalid keyfile/password or file has been corrupted)",
@@ -259,7 +263,10 @@ pub fn decrypt(
             };
 
         if crypt_header.compression {
-            unencrypted_file.write_all(&decoder.decompress_vec(&decrypted_data)?)?;
+            let decompressed_data: Zeroizing<Vec<u8>> =
+                Zeroizing::new(decoder.decompress_vec(&decrypted_data)?);
+
+            unencrypted_file.write_all(&decompressed_data)?;
         } else {
             unencrypted_file.write_all(&decrypted_data)?;
         }
@@ -273,10 +280,10 @@ pub fn decrypt(
 }
 
 pub fn gen_keyfile(verbose: bool, outputfile: PathBuf) -> Result<()> {
-    let mut key: [u8; XCHACHA20_KEY_LEN] = [0u8; XCHACHA20_KEY_LEN];
+    let mut key: Zeroizing<[u8; XCHACHA20_KEY_LEN]> = Zeroizing::new([0u8; XCHACHA20_KEY_LEN]);
 
     print_log(verbose, format!["Generating key"]);
-    OsRng.fill_bytes(&mut key);
+    OsRng.fill_bytes(key.as_mut_slice());
 
     print_log(verbose, format!["Writing key to file"]);
     fs::write(&outputfile, keyfile_to_pem(&key)?)?;
@@ -286,8 +293,7 @@ pub fn gen_keyfile(verbose: bool, outputfile: PathBuf) -> Result<()> {
 
 pub fn gen_keypair(verbose: bool, outputdir: PathBuf, prefix: String) -> Result<()> {
     print_log(verbose, format!["Generating private key"]);
-    let mut csprng: OsRng = OsRng;
-    let signing_key: SigningKey = SigningKey::generate(&mut csprng);
+    let signing_key: SigningKey = SigningKey::generate(&mut OsRng); // Zeroizing is already implemented for this type
 
     print_log(verbose, format!["Writing private key to file"]);
     signing_key.write_pkcs8_pem_file(
@@ -324,7 +330,7 @@ pub fn sign(
     outputfile: PathBuf,
 ) -> Result<()> {
     print_log(verbose, format!["Reading private key"]);
-    let mut signing_key: SigningKey = SigningKey::read_pkcs8_pem_file(&private_key)?;
+    let mut signing_key: SigningKey = SigningKey::read_pkcs8_pem_file(&private_key)?; // Zeroizing is already implemented for this type
 
     print_log(verbose, format!["Creating blake3 hash from file"]);
     let hash: [u8; BLAKE3_HASH_LEN] = hash_file(&inputfile)?;
