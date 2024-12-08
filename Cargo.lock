@@ -467,6 +467,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "indicatif",
+ "poly1305",
  "rand",
  "rpassword",
  "snap",

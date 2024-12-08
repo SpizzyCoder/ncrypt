@@ -14,6 +14,7 @@ use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, 
 use ed25519_dalek::Verifier;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
+use poly1305::Poly1305;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use snap::raw::{Decoder, Encoder};
@@ -42,6 +43,7 @@ pub fn encrypt(
     keyfile: Option<PathBuf>,
     inputfile: PathBuf,
     outputfile: PathBuf,
+    time_cost_argon2: u32,
 ) -> Result<()> {
     let mut key: Zeroizing<[u8; XCHACHA20_KEY_LEN]> = Zeroizing::new([0; XCHACHA20_KEY_LEN]);
     let password_salt: Option<[u8; ARGON2_SALT_LEN]>;
@@ -65,8 +67,17 @@ pub fn encrypt(
         let mut salt: [u8; ARGON2_SALT_LEN] = [0; ARGON2_SALT_LEN];
         OsRng.fill_bytes(&mut salt);
 
+        let argon2_hasher: Argon2 = Argon2::new(
+            argon2::Algorithm::default(),
+            argon2::Version::default(),
+            argon2::ParamsBuilder::new()
+                .t_cost(time_cost_argon2)
+                .build()
+                .unwrap(), // Unwrap is safe
+        );
+
         if let Err(err) =
-            Argon2::default().hash_password_into(password.as_bytes(), &salt, key.as_mut_slice())
+            argon2_hasher.hash_password_into(password.as_bytes(), &salt, key.as_mut_slice())
         {
             return Err(anyhow::Error::msg(format![
                 "Failed to derive key from password ({})",
@@ -89,13 +100,21 @@ pub fn encrypt(
 
     print_log(verbose, format!["Writing header to file"]);
     let header: NCryptFileHeader =
-        NCryptFileHeader::new(mode, compression, &nonce.into(), password_salt);
+        NCryptFileHeader::new(mode, compression, time_cost_argon2, nonce, password_salt);
     header.write_to_file(&mut encrypted_file)?;
+
+    print_log(verbose, format!["Writing tag of header"]);
+    let poly1305: Poly1305 = Poly1305::new_from_slice(key.as_slice())?;
+    let tag: [u8; XCHACHA20_TAG_LEN] = poly1305
+        .compute_unpadded(&header.to_bytes())
+        .try_into()
+        .unwrap(); // Unwrap is safe
+    encrypted_file.write_all(&tag)?;
 
     let progress_bar: ProgressBar = ProgressBar::new(unencrypted_file_metadata.len());
     progress_bar.set_style(
         ProgressStyle::with_template(PROGRESS_BAR_TEMPLATE)
-            .unwrap()
+            .unwrap() // unwrap is safe
             .progress_chars(PROGRESS_BAR_CHARS),
     );
 
@@ -171,29 +190,41 @@ pub fn decrypt(
 
     print_log(verbose, format!["Reading header"]);
     let crypt_header: NCryptFileHeader = NCryptFileHeader::read_from_file(&mut encrypted_file)?;
-    let mut nonce: [u8; XCHACHA20_NONCE_LEN] = crypt_header.nonce;
 
     let mut key: Zeroizing<[u8; XCHACHA20_KEY_LEN]> = Zeroizing::new([0; XCHACHA20_KEY_LEN]);
 
-    if keyfile.is_some() && crypt_header.mode == Mode::Keyfile {
+    if let Some(keyfile) = keyfile {
         print_log(verbose, format!["Reading keyfile"]);
 
-        let keyfile_content: Zeroizing<String> =
-            Zeroizing::new(fs::read_to_string(&keyfile.unwrap())?); // Unwrap is safe
+        let keyfile_content: Zeroizing<String> = Zeroizing::new(fs::read_to_string(&keyfile)?);
 
         key = Zeroizing::new(pem_to_keyfile(&keyfile_content)?);
-    } else if keyfile.is_none() && crypt_header.mode == Mode::Keyfile {
-        return Err(anyhow::Error::msg(format![
-            "File was encrypted with a keyfile -> provide a keyfile"
-        ]));
-    } else if keyfile.is_none() && crypt_header.mode == Mode::Password {
+    } else {
         let password: Zeroizing<String> = Zeroizing::new(rpassword::prompt_password("Password: ")?);
 
         print_log(verbose, format!["Deriving key from password"]);
 
-        if let Err(err) = Argon2::default().hash_password_into(
+        let password_salt: [u8; ARGON2_SALT_LEN] = match crypt_header.password_salt {
+            Some(salt) => salt,
+            None => {
+                return Err(anyhow::Error::msg(
+                    "No salt in header (needed for password decryption)",
+                ))
+            }
+        };
+
+        let argon2_hasher: Argon2 = Argon2::new(
+            argon2::Algorithm::default(),
+            argon2::Version::default(),
+            argon2::ParamsBuilder::new()
+                .t_cost(crypt_header.time_cost_argon2)
+                .build()
+                .unwrap(), // unwrap is safe
+        );
+
+        if let Err(err) = argon2_hasher.hash_password_into(
             password.as_bytes(),
-            crypt_header.password_salt.as_ref().unwrap(), // Unwrap is safe
+            &password_salt,
             key.as_mut_slice(),
         ) {
             return Err(anyhow::Error::msg(format![
@@ -201,9 +232,22 @@ pub fn decrypt(
                 err
             ]));
         }
-    } else if keyfile.is_some() && crypt_header.mode == Mode::Password {
+    }
+
+    let mut nonce: [u8; XCHACHA20_NONCE_LEN] = crypt_header.nonce;
+
+    print_log(verbose, format!["Check integrity of header (poly1305 tag)"]);
+    let poly1305: Poly1305 = Poly1305::new_from_slice(key.as_slice())?;
+    let calculated_tag: [u8; XCHACHA20_TAG_LEN] = poly1305
+        .compute_unpadded(&crypt_header.to_bytes())
+        .try_into()
+        .unwrap(); // unwrap is safe
+    let mut tag_from_file: [u8; XCHACHA20_TAG_LEN] = [0; XCHACHA20_TAG_LEN];
+    encrypted_file.read_exact(&mut tag_from_file)?;
+
+    if calculated_tag != tag_from_file {
         return Err(anyhow::Error::msg(format![
-            "File was encrypted with a password -> provide a password (remove keyfile)"
+            "Calculated tag doesn't match the tag in the file"
         ]));
     }
 
@@ -214,7 +258,7 @@ pub fn decrypt(
     let progress_bar: ProgressBar = ProgressBar::new(encrypted_file_metadata.len());
     progress_bar.set_style(
         ProgressStyle::with_template(PROGRESS_BAR_TEMPLATE)
-            .unwrap()
+            .unwrap() // unwrap is safe
             .progress_chars(PROGRESS_BAR_CHARS),
     );
 
@@ -271,7 +315,7 @@ pub fn decrypt(
             unencrypted_file.write_all(&decrypted_data)?;
         }
 
-        progress_bar.inc((4 + 16) + data_length as u64);
+        progress_bar.inc((4 + XCHACHA20_TAG_LEN as u64) + data_length as u64);
     }
 
     progress_bar.finish();

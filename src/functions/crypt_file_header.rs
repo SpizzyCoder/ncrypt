@@ -50,8 +50,9 @@ pub struct NCryptFileHeader {
     pub program_version_patch: u8,
     pub mode: Mode,
     pub compression: bool,
-    pub password_salt: Option<[u8; ARGON2_SALT_LEN]>,
+    pub time_cost_argon2: u32,
     pub nonce: [u8; XCHACHA20_NONCE_LEN],
+    pub password_salt: Option<[u8; ARGON2_SALT_LEN]>,
 }
 
 impl fmt::Display for NCryptFileHeader {
@@ -65,16 +66,17 @@ impl fmt::Display for NCryptFileHeader {
         ]?;
         writeln![f, "Mode: {}", self.mode]?;
         writeln![f, "Compression: {}", self.compression]?;
+        writeln![f, "Time cost argon2: {}", self.time_cost_argon2]?;
+
+        write![f, "Nonce: "]?;
+        write_readable_data(&mut f, &self.nonce)?;
 
         write![f, "Password salt: "]?;
         if let Some(password_salt) = self.password_salt {
-            write_data(&mut f, &password_salt)?;
+            write_readable_data(&mut f, &password_salt)?;
         } else {
             writeln![f, "None"]?;
         }
-
-        write![f, "Nonce: "]?;
-        write_data(&mut f, &self.nonce)?;
 
         return Ok(());
     }
@@ -84,7 +86,8 @@ impl NCryptFileHeader {
     pub fn new(
         mode: Mode,
         compression: bool,
-        nonce: &[u8; XCHACHA20_NONCE_LEN],
+        time_cost_argon2: u32,
+        nonce: [u8; XCHACHA20_NONCE_LEN],
         password_salt: Option<[u8; ARGON2_SALT_LEN]>,
     ) -> Self {
         return Self {
@@ -94,8 +97,9 @@ impl NCryptFileHeader {
             program_version_patch: env!["CARGO_PKG_VERSION_PATCH"].parse().unwrap(),
             mode,
             compression,
+            time_cost_argon2,
+            nonce,
             password_salt,
-            nonce: nonce.clone(),
         };
     }
 
@@ -120,6 +124,12 @@ impl NCryptFileHeader {
         let mut compression: [u8; 1] = [0; 1];
         file.read_exact(&mut compression)?;
 
+        let mut time_cost_argon2: [u8; 4] = [0; 4];
+        file.read_exact(&mut time_cost_argon2)?;
+
+        let mut nonce: [u8; XCHACHA20_NONCE_LEN] = [0; XCHACHA20_NONCE_LEN];
+        file.read_exact(&mut nonce)?;
+
         let mut password_salt: Option<[u8; ARGON2_SALT_LEN]> = None;
 
         if Mode::from_u8(mode[0]) == Mode::Password {
@@ -130,9 +140,6 @@ impl NCryptFileHeader {
             password_salt = Some(salt);
         }
 
-        let mut nonce: [u8; XCHACHA20_NONCE_LEN] = [0; XCHACHA20_NONCE_LEN];
-        file.read_exact(&mut nonce)?;
-
         return Ok(Self {
             signature: SIGNATURE,
             program_version_major: versions[0],
@@ -140,30 +147,40 @@ impl NCryptFileHeader {
             program_version_patch: versions[2],
             mode: Mode::from_u8(mode[0]),
             compression: if compression[0] == 1 { true } else { false },
-            password_salt,
+            time_cost_argon2: u32::from_be_bytes(time_cost_argon2),
             nonce,
+            password_salt,
         });
     }
 
     pub fn write_to_file(&self, file: &mut File) -> Result<()> {
-        file.write_all(self.signature.as_bytes())?;
-        file.write_all(&[
-            self.program_version_major,
-            self.program_version_minor,
-            self.program_version_patch,
-        ])?;
-        file.write_all(&[self.mode.to_u8()])?;
-        file.write_all(&[self.compression as u8])?;
-        if let Some(ref password_salt) = self.password_salt {
-            file.write_all(password_salt)?;
-        }
-        file.write_all(&self.nonce)?;
+        file.write_all(&self.to_bytes())?;
 
         return Ok(());
     }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes: Vec<u8> = Vec::new();
+
+        bytes.extend_from_slice(self.signature.as_bytes());
+        bytes.extend_from_slice(&[
+            self.program_version_major,
+            self.program_version_minor,
+            self.program_version_patch,
+        ]);
+        bytes.extend_from_slice(&[self.mode.to_u8()]);
+        bytes.extend_from_slice(&[self.compression as u8]);
+        bytes.extend_from_slice(&self.time_cost_argon2.to_be_bytes());
+        bytes.extend_from_slice(self.nonce.as_slice());
+        if let Some(ref password_salt) = self.password_salt {
+            bytes.extend_from_slice(password_salt);
+        }
+
+        return bytes;
+    }
 }
 
-fn write_data(mut writer: impl fmt::Write, data: &[u8]) -> fmt::Result {
+fn write_readable_data(mut writer: impl fmt::Write, data: &[u8]) -> fmt::Result {
     if data.len() > 6 {
         for byte in data[..3].iter() {
             write![writer, "{:02x}", byte]?;

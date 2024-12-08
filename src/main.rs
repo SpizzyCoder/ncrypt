@@ -24,6 +24,10 @@ enum Command {
         /// Output file
         #[arg(short)]
         outputfile: PathBuf,
+
+        /// Argon2 time cost
+        #[arg(short, default_value_t = 100)]
+        time_cost_argon2: u32,
     },
 
     /// Decrypt file
@@ -125,7 +129,15 @@ fn main() -> Result<()> {
             keyfile,
             inputfile,
             outputfile,
-        } => functions::encrypt(args.verbose, compression, keyfile, inputfile, outputfile)?,
+            time_cost_argon2,
+        } => functions::encrypt(
+            args.verbose,
+            compression,
+            keyfile,
+            inputfile,
+            outputfile,
+            time_cost_argon2,
+        )?,
         Command::Decrypt {
             keyfile,
             inputfile,
