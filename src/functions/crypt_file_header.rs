@@ -34,11 +34,14 @@ impl Mode {
         }
     }
 
-    fn from_u8(num: u8) -> Self {
+    fn from_u8(num: u8) -> Result<Self> {
         match num {
-            0 => Mode::Keyfile,
-            1 => Mode::Password,
-            _ => panic!["Invalid u8 (Failed to convert u8 to Mode enum)"],
+            0 => Ok(Mode::Keyfile),
+            1 => Ok(Mode::Password),
+            _ => Err(anyhow::Error::msg(format![
+                "Invalid mode byte in header ({})",
+                num
+            ])),
         }
     }
 }
@@ -118,8 +121,9 @@ impl NCryptFileHeader {
         let mut versions: [u8; 3] = [0; 3];
         file.read_exact(&mut versions)?;
 
-        let mut mode: [u8; 1] = [0; 1];
-        file.read_exact(&mut mode)?;
+        let mut mode_bytes: [u8; 1] = [0; 1];
+        file.read_exact(&mut mode_bytes)?;
+        let mode: Mode = Mode::from_u8(mode_bytes[0])?;
 
         let mut compression: [u8; 1] = [0; 1];
         file.read_exact(&mut compression)?;
@@ -132,7 +136,7 @@ impl NCryptFileHeader {
 
         let mut password_salt: Option<[u8; ARGON2_SALT_LEN]> = None;
 
-        if Mode::from_u8(mode[0]) == Mode::Password {
+        if mode == Mode::Password {
             let mut salt: [u8; ARGON2_SALT_LEN] = [0; ARGON2_SALT_LEN];
 
             file.read_exact(&mut salt)?;
@@ -145,7 +149,7 @@ impl NCryptFileHeader {
             program_version_major: versions[0],
             program_version_minor: versions[1],
             program_version_patch: versions[2],
-            mode: Mode::from_u8(mode[0]),
+            mode,
             compression: if compression[0] == 1 { true } else { false },
             time_cost_argon2: u32::from_be_bytes(time_cost_argon2),
             nonce,
