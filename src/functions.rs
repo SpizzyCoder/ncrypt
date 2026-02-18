@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::fs::{self, Metadata};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -33,6 +33,7 @@ const ARGON2_SALT_LEN: usize = 64;
 const XCHACHA20_TAG_LEN: usize = 16;
 const ED25519_SIGNATURE_LEN: usize = 64;
 const BLAKE3_HASH_LEN: usize = 32;
+const STREAM_END_MARKER: u32 = u32::MAX;
 const PROGRESS_BAR_TEMPLATE: &'static str =
     "[{bar:40.cyan/blue}] {percent}% {binary_bytes}/{binary_total_bytes}";
 const PROGRESS_BAR_CHARS: &'static str = "=>-";
@@ -174,6 +175,24 @@ pub fn encrypt(
         progress_bar.inc(read_bytes as u64);
     }
 
+    // Write an authenticated end-of-stream marker so truncation is detectable.
+    match cipher.encrypt(
+        nonce.as_ref().into(),
+        STREAM_END_MARKER.to_be_bytes().as_slice(),
+    ) {
+        Ok(ciphertext) => {
+            encrypted_file.write_all(&ciphertext)?;
+
+            increment_nonce(&mut nonce);
+        }
+        Err(err) => {
+            return Err(anyhow::Error::msg(format![
+                "Failed to write end-of-stream marker ({})",
+                err
+            ]));
+        }
+    }
+
     progress_bar.finish();
 
     return Ok(());
@@ -268,10 +287,14 @@ pub fn decrypt(
     let mut decrypted_data: Zeroizing<Vec<u8>>;
     let mut decoder: Decoder = Decoder::new();
     loop {
-        let read_bytes: usize = encrypted_file.read(length_buffer.as_mut_slice())?;
+        if let Err(err) = encrypted_file.read_exact(length_buffer.as_mut_slice()) {
+            if err.kind() == ErrorKind::UnexpectedEof {
+                return Err(anyhow::Error::msg(
+                    "Unexpected EOF before end-of-stream marker (file is truncated or corrupted)",
+                ));
+            }
 
-        if read_bytes == 0 {
-            break;
+            return Err(err.into());
         }
 
         let data_length: u32 = {
@@ -291,8 +314,26 @@ pub fn decrypt(
             u32::from_be_bytes(byte_array)
         };
 
+        if data_length == STREAM_END_MARKER {
+            break;
+        }
+
+        if data_length < XCHACHA20_TAG_LEN as u32 {
+            return Err(anyhow::Error::msg(
+                "Invalid encrypted chunk length (file is corrupted)",
+            ));
+        }
+
         let mut encrypted_data: Vec<u8> = vec![0; data_length as usize];
-        encrypted_file.read_exact(&mut encrypted_data)?;
+        if let Err(err) = encrypted_file.read_exact(&mut encrypted_data) {
+            if err.kind() == ErrorKind::UnexpectedEof {
+                return Err(anyhow::Error::msg(
+                    "Unexpected EOF while reading encrypted chunk (file is truncated or corrupted)",
+                ));
+            }
+
+            return Err(err.into());
+        }
 
         decrypted_data =
             match cipher.decrypt(&nonce.into(), encrypted_data.as_ref()) {
@@ -316,6 +357,13 @@ pub fn decrypt(
         }
 
         progress_bar.inc((4 + XCHACHA20_TAG_LEN as u64) + data_length as u64);
+    }
+
+    let mut trailing_byte: [u8; 1] = [0];
+    if encrypted_file.read(&mut trailing_byte)? != 0 {
+        return Err(anyhow::Error::msg(
+            "Found trailing data after end-of-stream marker (file is corrupted)",
+        ));
     }
 
     progress_bar.finish();
