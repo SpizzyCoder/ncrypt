@@ -110,7 +110,12 @@ enum Command {
 /// Hashing: Blake3
 /// Compression: Snappy
 #[derive(Parser)]
-#[command(version, about, verbatim_doc_comment)]
+#[command(
+    version,
+    about,
+    verbatim_doc_comment,
+    after_help = "License: GNU GPL v3 (or later). See LICENSE for details.\nThis program comes with ABSOLUTELY NO WARRANTY."
+)]
 struct Args {
     /// Verbose output
     #[arg(short, long)]
