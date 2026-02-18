@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use argon2::Argon2;
 use blake3::Hasher;
+use chacha20poly1305::aead::rand_core::RngCore;
 use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::OsRng;
 use chacha20poly1305::{AeadCore, KeyInit, XChaCha20Poly1305};
 use ed25519_dalek::ed25519::signature::SignerMut;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
@@ -14,8 +16,6 @@ use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, 
 use ed25519_dalek::Verifier;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::rngs::OsRng;
-use rand::RngCore;
 use snap::raw::{Decoder, Encoder};
 use zeroize::Zeroizing;
 
