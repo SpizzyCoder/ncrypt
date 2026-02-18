@@ -48,7 +48,7 @@ fn pem_to_data<T>(pem: &str, pem_begin: &str, pem_end: &str) -> Result<T>
 where
     T: TryFrom<Vec<u8>>,
 {
-    let pem_splitted: Vec<&str> = pem.trim().split("\n").collect();
+    let pem_splitted: Vec<&str> = pem.trim().lines().collect();
 
     if pem_splitted.len() != 3 {
         return Err(anyhow::Error::msg("Invalid pem file"));
