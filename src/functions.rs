@@ -361,7 +361,8 @@ pub fn gen_keyfile(verbose: bool, outputfile: PathBuf) -> Result<()> {
     OsRng.fill_bytes(key.as_mut_slice());
 
     print_log(verbose, format!["Writing key to file"]);
-    fs::write(&outputfile, keyfile_to_pem(&key)?)?;
+    let pem: String = keyfile_to_pem(&key)?;
+    write_keyfile_secure(&outputfile, pem.as_bytes())?;
 
     return Ok(());
 }
@@ -493,6 +494,36 @@ fn build_argon2_hasher(time_cost_argon2: u32) -> Result<Argon2<'static>> {
         argon2::Version::default(),
         params,
     ));
+}
+
+fn write_keyfile_secure(outputfile: &Path, data: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file: File = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(outputfile)?;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(data)?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut file: File = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(outputfile)?;
+
+        file.write_all(data)?;
+    }
+
+    return Ok(());
 }
 
 fn hash_file(filepath: &Path) -> Result<[u8; BLAKE3_HASH_LEN]> {
