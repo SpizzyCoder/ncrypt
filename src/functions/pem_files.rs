@@ -6,9 +6,9 @@ use base64::{prelude::BASE64_STANDARD, Engine};
 use super::{ED25519_SIGNATURE_LEN, XCHACHA20_KEY_LEN};
 
 const KEYFILE_PEM_BEGIN: &'static str = "----- BEGIN NCRYPT KEYFILE -----";
-const KEYFILE_PEM_END: &'static str = "----- BEGIN NCRYPT KEYFILE -----";
+const KEYFILE_PEM_END: &'static str = "----- END NCRYPT KEYFILE -----";
 const SIGNATURE_PEM_BEGIN: &'static str = "----- BEGIN NCRYPT SIGNATURE -----";
-const SIGNATURE_PEM_END: &'static str = "----- BEGIN NCRYPT SIGNATURE -----";
+const SIGNATURE_PEM_END: &'static str = "----- END NCRYPT SIGNATURE -----";
 
 pub fn keyfile_to_pem(key: &[u8; XCHACHA20_KEY_LEN]) -> Result<String> {
     return Ok(data_to_pem(key, KEYFILE_PEM_BEGIN, KEYFILE_PEM_END)?);
