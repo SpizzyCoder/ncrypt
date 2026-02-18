@@ -14,7 +14,6 @@ use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, 
 use ed25519_dalek::Verifier;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
-use poly1305::Poly1305;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use snap::raw::{Decoder, Encoder};
@@ -33,6 +32,10 @@ const ARGON2_SALT_LEN: usize = 64;
 const XCHACHA20_TAG_LEN: usize = 16;
 const ED25519_SIGNATURE_LEN: usize = 64;
 const BLAKE3_HASH_LEN: usize = 32;
+const HEADER_TAG_LEN: usize = BLAKE3_HASH_LEN;
+const HEADER_TAG_KEY_CONTEXT: &'static str = "ncrypt/header-mac/v1";
+const ARGON2_TIME_COST_MIN: u32 = 1;
+const ARGON2_TIME_COST_MAX: u32 = 1_000;
 const STREAM_END_MARKER: u32 = u32::MAX;
 const PROGRESS_BAR_TEMPLATE: &'static str =
     "[{bar:40.cyan/blue}] {percent}% {binary_bytes}/{binary_total_bytes}";
@@ -68,14 +71,7 @@ pub fn encrypt(
         let mut salt: [u8; ARGON2_SALT_LEN] = [0; ARGON2_SALT_LEN];
         OsRng.fill_bytes(&mut salt);
 
-        let argon2_hasher: Argon2 = Argon2::new(
-            argon2::Algorithm::default(),
-            argon2::Version::default(),
-            argon2::ParamsBuilder::new()
-                .t_cost(time_cost_argon2)
-                .build()
-                .unwrap(), // Unwrap is safe
-        );
+        let argon2_hasher: Argon2 = build_argon2_hasher(time_cost_argon2)?;
 
         if let Err(err) =
             argon2_hasher.hash_password_into(password.as_bytes(), &salt, key.as_mut_slice())
@@ -104,12 +100,8 @@ pub fn encrypt(
         NCryptFileHeader::new(mode, compression, time_cost_argon2, nonce, password_salt);
     header.write_to_file(&mut encrypted_file)?;
 
-    print_log(verbose, format!["Writing tag of header"]);
-    let poly1305: Poly1305 = Poly1305::new_from_slice(key.as_slice())?;
-    let tag: [u8; XCHACHA20_TAG_LEN] = poly1305
-        .compute_unpadded(&header.to_bytes())
-        .try_into()
-        .unwrap(); // Unwrap is safe
+    print_log(verbose, format!["Writing MAC of header"]);
+    let tag: [u8; HEADER_TAG_LEN] = calculate_header_tag(key.as_ref(), &header);
     encrypted_file.write_all(&tag)?;
 
     let progress_bar: ProgressBar = ProgressBar::new(unencrypted_file_metadata.len());
@@ -219,10 +211,6 @@ pub fn decrypt(
 
         key = Zeroizing::new(pem_to_keyfile(&keyfile_content)?);
     } else {
-        let password: Zeroizing<String> = Zeroizing::new(rpassword::prompt_password("Password: ")?);
-
-        print_log(verbose, format!["Deriving key from password"]);
-
         let password_salt: [u8; ARGON2_SALT_LEN] = match crypt_header.password_salt {
             Some(salt) => salt,
             None => {
@@ -232,14 +220,13 @@ pub fn decrypt(
             }
         };
 
-        let argon2_hasher: Argon2 = Argon2::new(
-            argon2::Algorithm::default(),
-            argon2::Version::default(),
-            argon2::ParamsBuilder::new()
-                .t_cost(crypt_header.time_cost_argon2)
-                .build()
-                .unwrap(), // unwrap is safe
-        );
+        validate_argon2_time_cost(crypt_header.time_cost_argon2)?;
+
+        let password: Zeroizing<String> = Zeroizing::new(rpassword::prompt_password("Password: ")?);
+
+        print_log(verbose, format!["Deriving key from password"]);
+
+        let argon2_hasher: Argon2 = build_argon2_hasher(crypt_header.time_cost_argon2)?;
 
         if let Err(err) = argon2_hasher.hash_password_into(
             password.as_bytes(),
@@ -255,18 +242,14 @@ pub fn decrypt(
 
     let mut nonce: [u8; XCHACHA20_NONCE_LEN] = crypt_header.nonce;
 
-    print_log(verbose, format!["Check integrity of header (poly1305 tag)"]);
-    let poly1305: Poly1305 = Poly1305::new_from_slice(key.as_slice())?;
-    let calculated_tag: [u8; XCHACHA20_TAG_LEN] = poly1305
-        .compute_unpadded(&crypt_header.to_bytes())
-        .try_into()
-        .unwrap(); // unwrap is safe
-    let mut tag_from_file: [u8; XCHACHA20_TAG_LEN] = [0; XCHACHA20_TAG_LEN];
+    print_log(verbose, format!["Check integrity of header (MAC)"]);
+    let calculated_tag: [u8; HEADER_TAG_LEN] = calculate_header_tag(key.as_ref(), &crypt_header);
+    let mut tag_from_file: [u8; HEADER_TAG_LEN] = [0; HEADER_TAG_LEN];
     encrypted_file.read_exact(&mut tag_from_file)?;
 
     if calculated_tag != tag_from_file {
         return Err(anyhow::Error::msg(format![
-            "Calculated tag doesn't match the tag in the file"
+            "Calculated header MAC doesn't match the MAC in the file"
         ]));
     }
 
@@ -476,6 +459,40 @@ fn increment_nonce(nonce: &mut [u8; XCHACHA20_NONCE_LEN]) {
             *byte = 0;
         }
     }
+}
+
+fn calculate_header_tag(key: &[u8], header: &NCryptFileHeader) -> [u8; HEADER_TAG_LEN] {
+    let header_tag_key: [u8; XCHACHA20_KEY_LEN] = blake3::derive_key(HEADER_TAG_KEY_CONTEXT, key);
+    let header_tag: [u8; BLAKE3_HASH_LEN] =
+        blake3::keyed_hash(&header_tag_key, &header.to_bytes()).into();
+
+    return header_tag;
+}
+
+fn validate_argon2_time_cost(time_cost_argon2: u32) -> Result<()> {
+    if (ARGON2_TIME_COST_MIN..=ARGON2_TIME_COST_MAX).contains(&time_cost_argon2) {
+        return Ok(());
+    }
+
+    return Err(anyhow::Error::msg(format![
+        "Unsupported Argon2 time cost {} (allowed range: {}..={})",
+        time_cost_argon2, ARGON2_TIME_COST_MIN, ARGON2_TIME_COST_MAX
+    ]));
+}
+
+fn build_argon2_hasher(time_cost_argon2: u32) -> Result<Argon2<'static>> {
+    validate_argon2_time_cost(time_cost_argon2)?;
+
+    let params: argon2::Params = argon2::ParamsBuilder::new()
+        .t_cost(time_cost_argon2)
+        .build()
+        .map_err(|err| anyhow::Error::msg(format!["Invalid Argon2 parameters ({})", err]))?;
+
+    return Ok(Argon2::new(
+        argon2::Algorithm::default(),
+        argon2::Version::default(),
+        params,
+    ));
 }
 
 fn hash_file(filepath: &Path) -> Result<[u8; BLAKE3_HASH_LEN]> {
