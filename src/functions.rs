@@ -6,16 +6,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use argon2::Argon2;
 use blake3::Hasher;
-use chacha20poly1305::aead::rand_core::RngCore;
 use chacha20poly1305::aead::Aead;
-use chacha20poly1305::aead::OsRng;
-use chacha20poly1305::{AeadCore, KeyInit, XChaCha20Poly1305};
-use ed25519_dalek::ed25519::signature::SignerMut;
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+use ed25519_dalek::{Signer, Verifier};
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
-use ed25519_dalek::Verifier;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::Rng;
 use snap::raw::{Decoder, Encoder};
 use zeroize::Zeroizing;
 
@@ -69,7 +67,7 @@ pub fn encrypt(
         print_log(verbose, format!["Deriving key from password"]);
 
         let mut salt: [u8; ARGON2_SALT_LEN] = [0; ARGON2_SALT_LEN];
-        OsRng.fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut salt);
 
         let argon2_hasher: Argon2 = build_argon2_hasher(time_cost_argon2)?;
 
@@ -86,14 +84,16 @@ pub fn encrypt(
         mode = Mode::Password;
     }
 
-    let cipher: XChaCha20Poly1305 = XChaCha20Poly1305::new(key.as_ref().into());
+    let cipher: XChaCha20Poly1305 =
+        XChaCha20Poly1305::new_from_slice(key.as_ref()).expect("key length is fixed at 32 bytes");
 
     let unencrypted_file_metadata: Metadata = fs::metadata(&inputfile)?;
     let mut unencrypted_file: File = File::open(&inputfile)?;
     let mut encrypted_file: File = File::create(&outputfile)?;
 
     print_log(verbose, format!["Generating nonce"]);
-    let mut nonce: [u8; XCHACHA20_NONCE_LEN] = XChaCha20Poly1305::generate_nonce(&mut OsRng).into();
+    let mut nonce: [u8; XCHACHA20_NONCE_LEN] = [0; XCHACHA20_NONCE_LEN];
+    rand::rng().fill_bytes(&mut nonce);
 
     print_log(verbose, format!["Writing header to file"]);
     let header: NCryptFileHeader =
@@ -134,7 +134,7 @@ pub fn encrypt(
         data_length_to_write = Zeroizing::new((data_to_write.len() + XCHACHA20_TAG_LEN) as u32);
 
         match cipher.encrypt(
-            nonce.as_ref().into(),
+            &nonce.into(),
             data_length_to_write.to_be_bytes().as_slice(),
         ) {
             Ok(ciphertext) => {
@@ -150,7 +150,7 @@ pub fn encrypt(
             }
         }
 
-        match cipher.encrypt(nonce.as_ref().into(), data_to_write.as_ref()) {
+        match cipher.encrypt(&nonce.into(), data_to_write.as_ref()) {
             Ok(ciphertext) => {
                 encrypted_file.write_all(&ciphertext)?;
 
@@ -169,7 +169,7 @@ pub fn encrypt(
 
     // Write an authenticated end-of-stream marker so truncation is detectable.
     match cipher.encrypt(
-        nonce.as_ref().into(),
+        &nonce.into(),
         STREAM_END_MARKER.to_be_bytes().as_slice(),
     ) {
         Ok(ciphertext) => {
@@ -253,7 +253,8 @@ pub fn decrypt(
         ]));
     }
 
-    let cipher: XChaCha20Poly1305 = XChaCha20Poly1305::new(key.as_ref().into());
+    let cipher: XChaCha20Poly1305 =
+        XChaCha20Poly1305::new_from_slice(key.as_ref()).expect("key length is fixed at 32 bytes");
 
     let mut unencrypted_file: File = File::create(&outputfile)?;
 
@@ -358,7 +359,7 @@ pub fn gen_keyfile(verbose: bool, outputfile: PathBuf) -> Result<()> {
     let mut key: Zeroizing<[u8; XCHACHA20_KEY_LEN]> = Zeroizing::new([0u8; XCHACHA20_KEY_LEN]);
 
     print_log(verbose, format!["Generating key"]);
-    OsRng.fill_bytes(key.as_mut_slice());
+    rand::rng().fill_bytes(key.as_mut_slice());
 
     print_log(verbose, format!["Writing key to file"]);
     let pem: String = keyfile_to_pem(&key)?;
@@ -369,21 +370,22 @@ pub fn gen_keyfile(verbose: bool, outputfile: PathBuf) -> Result<()> {
 
 pub fn gen_keypair(verbose: bool, outputdir: PathBuf, prefix: String) -> Result<()> {
     print_log(verbose, format!["Generating private key"]);
-    let signing_key: SigningKey = SigningKey::generate(&mut OsRng); // Zeroizing is already implemented for this type
+    let signing_key: SigningKey = SigningKey::generate(&mut rand::rng()); // Zeroizing is already implemented for this type
 
     print_log(verbose, format!["Writing private key to file"]);
-    signing_key.write_pkcs8_pem_file(
-        format!["{}/{}_prvkey.pem", outputdir.display(), prefix],
-        LineEnding::LF,
+    let private_key_pem = signing_key.to_pkcs8_pem(LineEnding::LF)?;
+    write_keyfile_secure(
+        &outputdir.join(format!["{}_prvkey.pem", prefix]),
+        private_key_pem.as_bytes(),
     )?;
 
     print_log(
         verbose,
         format!["Deriving (from private key) and writing public key to file"],
     );
-    signing_key.verifying_key().write_public_key_pem_file(
-        format!["{}/{}_pubkey.pem", outputdir.display(), prefix],
-        LineEnding::LF,
+    fs::write(
+        outputdir.join(format!["{}_pubkey.pem", prefix]),
+        signing_key.verifying_key().to_public_key_pem(LineEnding::LF)?,
     )?;
 
     return Ok(());
@@ -406,7 +408,8 @@ pub fn sign(
     outputfile: PathBuf,
 ) -> Result<()> {
     print_log(verbose, format!["Reading private key"]);
-    let mut signing_key: SigningKey = SigningKey::read_pkcs8_pem_file(&private_key)?; // Zeroizing is already implemented for this type
+    let private_key_pem = Zeroizing::new(fs::read_to_string(&private_key)?);
+    let signing_key: SigningKey = SigningKey::from_pkcs8_pem(&private_key_pem)?; // Zeroizing is already implemented for this type
 
     print_log(verbose, format!["Creating blake3 hash from file"]);
     let hash: [u8; BLAKE3_HASH_LEN] = hash_file(&inputfile)?;
@@ -431,7 +434,8 @@ pub fn verify(
     let hash: [u8; BLAKE3_HASH_LEN] = hash_file(&inputfile)?;
 
     print_log(verbose, format!["Reading public key"]);
-    let public_key: VerifyingKey = VerifyingKey::read_public_key_pem_file(&public_key)?;
+    let public_key_pem: String = fs::read_to_string(&public_key)?;
+    let public_key: VerifyingKey = VerifyingKey::from_public_key_pem(&public_key_pem)?;
 
     let signature: [u8; ED25519_SIGNATURE_LEN] = {
         print_log(verbose, format!["Reading signature"]);
