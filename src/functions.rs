@@ -373,7 +373,7 @@ pub fn gen_keypair(verbose: bool, outputdir: PathBuf, prefix: String) -> Result<
     let signing_key: SigningKey = SigningKey::generate(&mut rand::rng()); // Zeroizing is already implemented for this type
 
     print_log(verbose, format!["Writing private key to file"]);
-    let private_key_pem = signing_key.to_pkcs8_pem(LineEnding::LF)?;
+    let private_key_pem: Zeroizing<String> = signing_key.to_pkcs8_pem(LineEnding::LF)?;
     write_keyfile_secure(
         &outputdir.join(format!["{}_prvkey.pem", prefix]),
         private_key_pem.as_bytes(),
@@ -408,7 +408,7 @@ pub fn sign(
     outputfile: PathBuf,
 ) -> Result<()> {
     print_log(verbose, format!["Reading private key"]);
-    let private_key_pem = Zeroizing::new(fs::read_to_string(&private_key)?);
+    let private_key_pem: Zeroizing<String> = Zeroizing::new(fs::read_to_string(&private_key)?);
     let signing_key: SigningKey = SigningKey::from_pkcs8_pem(&private_key_pem)?; // Zeroizing is already implemented for this type
 
     print_log(verbose, format!["Creating blake3 hash from file"]);
